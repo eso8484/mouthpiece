@@ -1,0 +1,35 @@
+[project]
+name = "mouthpiece"
+version = "1.0.0"
+description = "Push-to-talk dictation for Linux: hold a hotkey, speak, release — the text is pasted into any app."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "eso8484" }]
+dependencies = [
+    "numpy>=2.0",
+    "sounddevice>=0.5",
+    "onnxruntime>=1.20",
+    "onnx-asr>=0.12",
+    "huggingface_hub>=0.30",
+    "soundfile>=0.13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+mouthpiece = "mouthpiece.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/eso8484/mouthpiece"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mouthpiece"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
