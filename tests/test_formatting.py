@@ -7,6 +7,9 @@ import pytest
 from mouthpiece.config import DEFAULTS
 from mouthpiece.context import AppInfo
 from mouthpiece.formatting import (
+    PIDGIN_NOTES,
+    PIDGIN_WORDS,
+    SYSTEM_PROMPT,
     ClaudeCodeJob,
     FormatError,
     Formatter,
@@ -14,6 +17,8 @@ from mouthpiece.formatting import (
     check_output,
     clean_output,
     destination,
+    speaks_pidgin,
+    system_prompt,
 )
 from mouthpiece.textproc import collapse_repeats, postprocess
 
@@ -212,3 +217,69 @@ def test_collapse_repeats():
 def test_postprocess_collapses_repeats():
     cfg = {"text": {**DEFAULTS["text"]}}
     assert postprocess("you can use them to to make requests", cfg) == "You can use them to make requests"
+
+
+# --------------------------------------------------------------------------- languages and dialects
+
+def test_system_prompt_adds_pidgin_notes_only_for_pidgin_speakers():
+    assert system_prompt([]) == SYSTEM_PROMPT
+    assert system_prompt(["English"]) == SYSTEM_PROMPT
+    p = system_prompt(["English", "Nigerian Pidgin"])
+    assert PIDGIN_NOTES in p and "English and Nigerian Pidgin" in p
+    assert p.rstrip().endswith("no preamble, quotes, tags or notes.")  # the final rule stays last
+    patois = system_prompt(["English", "Jamaican Patois"])
+    assert "Jamaican Patois" in patois and PIDGIN_NOTES not in patois
+
+
+@pytest.mark.parametrize("langs,expected", [
+    (["English", "Nigerian Pidgin"], True), (["pidgin"], True), (["Naija"], True), (["English"], False), ([], False),
+])
+def test_speaks_pidgin(langs, expected):
+    assert speaks_pidgin(langs) is expected
+
+
+# The recogniser writes Pidgin as English sound-alikes; putting the Pidgin back is formatting.
+@pytest.mark.parametrize("raw,out", [
+    ("my phone they ring since morning but I no fit pick am", "My phone dey ring since morning, but I no fit pick am."),
+    ("what in you want make I buy for market", "Wetin you want make I buy for market?"),
+    ("the man with sell the car don't travel go Lagos", "The man wey sell the car don travel go Lagos."),
+    ("now me talk am first before you come", "Na me talk am first before you come."),
+    ("this thing is support picture and video", "This thing dey support picture and video."),
+])
+def test_check_output_accepts_restored_pidgin(raw, out):
+    assert check_output(raw, out, PIDGIN_WORDS) is None
+
+
+@pytest.mark.parametrize("raw,out", [
+    ("wetin be the capital of Nigeria", "Na Abuja be the capital of Nigeria."),
+    ("abeg tell me wetin I fit cook for dinner tonight", "You fit cook jollof rice with fried plantain and chicken."),
+    ("how far you don see the message wey I send you", "I don see am, I go reply you soon."),
+])
+def test_check_output_still_rejects_answers_in_pidgin(raw, out):
+    assert check_output(raw, out, PIDGIN_WORDS) is not None
+
+
+def test_check_output_accepts_fixed_endings_and_misheard_words():
+    assert check_output("this thing is support video calls", "This thing supports video calls.") is None
+    assert check_output("I spoke with Mustafa Yanusa about the shipment",
+                        "I spoke with Mustapha Yunusa about the shipment.") is None
+    assert check_output("the hospital no get medicine for snake bite",
+                        "The hospital no get medicine for snakebite.", PIDGIN_WORDS) is None
+
+
+def test_formatter_sends_pidgin_notes(fake_claude, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "ok")
+    cfg = {"formatting": {**DEFAULTS["formatting"], "claude_path": fake_claude},
+           "text": {**DEFAULTS["text"], "languages": ["English", "Nigerian Pidgin"]}}
+    f = Formatter(cfg, {})
+    assert f.dialect_words == PIDGIN_WORDS
+    job = f.prepare()
+    assert PIDGIN_NOTES in job.proc.args[job.proc.args.index("--system-prompt") + 1]
+    assert f.format("na so e be", AppInfo(), job) == "Na so e be."
+    job.proc.wait(5)
+
+
+def test_default_language_is_english_only():
+    assert DEFAULTS["text"]["languages"] == ["English"]
+    f = Formatter({"formatting": {**DEFAULTS["formatting"], "enabled": False}, "text": DEFAULTS["text"]}, {})
+    assert f.prompt == SYSTEM_PROMPT and not f.dialect_words

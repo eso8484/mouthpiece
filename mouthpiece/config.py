@@ -56,6 +56,11 @@ live_segments = true
 # Words and names you use often, spelled the way you want them (fixes capitalisation and
 # guides cloud models).
 vocabulary = ["Claude Code", "Codex", "WhatsApp", "GitHub", "JavaScript", "TypeScript", "Python"]
+# The languages and dialects you dictate in. AI formatting keeps each one as you spoke it, and
+# with "Nigerian Pidgin" listed it writes your Pidgin as proper Pidgin (wetin, dey, abeg...)
+# instead of the English sound-alikes the recogniser hears ("what in", "they", "a bag").
+# Example: ["English", "Nigerian Pidgin"]
+languages = ["English"]
 remove_fillers = true
 # Start each dictation with a capital letter.
 capitalize_first = true

@@ -118,11 +118,38 @@ example an answer to a question you dictated. Your original wording is kept in t
 | `formatting.model` | `""` = default (`opus` for Claude Code); `sonnet` or `haiku` also work |
 | `formatting.effort` | Claude's thinking effort; `low` is fastest |
 | `formatting.timeout_s` | paste the plain transcript if formatting takes longer (plus 1 s per 40 words) |
+| `text.languages` | the languages and dialects you speak, e.g. `["English", "Nigerian Pidgin"]`; each is kept as you spoke it |
 
 Try it without speaking: `mouthpiece format --for chat "so um i was thinking we we could meet
 tomorrow at at five"`. Formatting sends the transcribed text (not your audio) to Anthropic, or
 to Groq/OpenAI if you use those. Through Claude Code, each dictation uses a little of your
 Claude plan.
+
+### Nigerian Pidgin
+
+The offline speech models only know standard English, so Pidgin comes out as English
+sound-alikes: "what in you they do" for "wetin you dey do". Tell Mouthpiece you speak Pidgin:
+
+```bash
+mouthpiece config set text.languages '["English", "Nigerian Pidgin"]'
+```
+
+Formatting then keeps Pidgin as Pidgin (it never "corrects" it into English), spells it the way
+people type it in chats, and puts back the Pidgin words the recogniser misheard. English stays
+English, and you can mix both in one message. "my phone they ring since morning but I no fit
+pick am" becomes "My phone dey ring since morning, but I no fit pick am."
+
+Measured on 40 Pidgin recordings from 5 speakers ([Nigerian Pidgin ASR dataset](https://huggingface.co/datasets/asr-nigerian-pidgin/nigerian-pidgin-1.0), CC BY 4.0):
+
+| | Words right | Pidgin grammar words kept (dey, don, na, wey…) |
+|---|---|---|
+| Without the setting | 48.5% | 18% |
+| With the setting | 56.2% | 42% |
+| With the setting and the English-only model | 63.5% | 51% |
+
+The English-only model (`mouthpiece config set transcription.local_model parakeet-v2`) hears
+Pidgin better but is slightly less accurate on accented English (see the table below). Fast or
+mumbled speech can still come out garbled.
 
 ## Accuracy
 

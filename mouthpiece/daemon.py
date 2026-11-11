@@ -18,7 +18,7 @@ from .config import load_config, load_secrets
 from .context import AppInfo, AppProbe
 from .control import ControlServer
 from .engines import CloudEngine, EngineError, LocalEngine, build_engine
-from .formatting import FormatError, Formatter
+from .formatting import FormatError, Formatter, speaks_pidgin
 from .gnome_keys import EscapeSwallower, is_gnome
 from .hotkey import MODIFIER_CODES, Action, Hotkey, HotkeyError, HotkeyListener
 from .injector import Injector
@@ -283,6 +283,9 @@ class Daemon:
     def _prompt_for(self, s: Session) -> str:
         vocab = self.cfg["text"].get("vocabulary") or []
         parts = []
+        if speaks_pidgin(self.cfg["text"].get("languages") or []):
+            # cloud Whisper copies the spelling style of its prompt
+            parts.append("Abeg, wetin dey happen? Make una no vex, I dey come now now.")
         if vocab:
             parts.append("Vocabulary: " + ", ".join(vocab) + ".")
         prev = s.text_so_far()
