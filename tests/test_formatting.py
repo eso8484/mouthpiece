@@ -1,3 +1,4 @@
+import json
 import stat
 import sys
 import time
@@ -11,12 +12,15 @@ from mouthpiece.formatting import (
     PIDGIN_WORDS,
     SYSTEM_PROMPT,
     ClaudeCodeJob,
+    ClaudeUnavailable,
     FormatError,
     Formatter,
     build_message,
     check_output,
+    claude_unavailable,
     clean_output,
     destination,
+    language_words,
     speaks_pidgin,
     system_prompt,
 )
@@ -113,6 +117,10 @@ if mode == "slow":
 if mode == "error":
     print(json.dumps({{"type": "result", "subtype": "success", "is_error": True, "result": "Not logged in"}}), flush=True)
     sys.exit(1)
+if mode == "limit":
+    msg = "You've hit your 5-hour limit · resets 8:15am (Europe/London)"
+    print(json.dumps({{"type": "result", "subtype": "success", "is_error": True, "result": msg}}), flush=True)
+    sys.exit(1)
 answer = transcript[:1].upper() + transcript[1:].rstrip(".") + "."
 print(json.dumps({{"type": "assistant", "message": {{}}}}), flush=True)
 print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": answer}}), flush=True)
@@ -192,7 +200,7 @@ def test_provider_resolution(tmp_path, monkeypatch):
     none = Formatter({"formatting": {**DEFAULTS["formatting"]}, "text": text}, {})
     assert none.provider == "none" and not none.active and "set-key groq" in none.problem
     groq = Formatter({"formatting": {**DEFAULTS["formatting"]}, "text": text}, {"groq": "k"})
-    assert groq.provider == "groq" and groq.model == "llama-3.3-70b-versatile"
+    assert groq.provider == "groq" and groq.model == "openai/gpt-oss-120b"
     off = Formatter({"formatting": {**DEFAULTS["formatting"], "enabled": False}, "text": text}, {"groq": "k"})
     assert off.describe() == "off" and not off.active
     bad = Formatter({"formatting": {**DEFAULTS["formatting"], "provider": "nope"}, "text": text}, {})
@@ -272,7 +280,7 @@ def test_formatter_sends_pidgin_notes(fake_claude, monkeypatch):
     cfg = {"formatting": {**DEFAULTS["formatting"], "claude_path": fake_claude},
            "text": {**DEFAULTS["text"], "languages": ["English", "Nigerian Pidgin"]}}
     f = Formatter(cfg, {})
-    assert f.dialect_words == PIDGIN_WORDS
+    assert f.dialect_words == PIDGIN_WORDS | {"nigerian", "pidgin", "english"}
     job = f.prepare()
     assert PIDGIN_NOTES in job.proc.args[job.proc.args.index("--system-prompt") + 1]
     assert f.format("na so e be", AppInfo(), job) == "Na so e be."
@@ -282,4 +290,101 @@ def test_formatter_sends_pidgin_notes(fake_claude, monkeypatch):
 def test_default_language_is_english_only():
     assert DEFAULTS["text"]["languages"] == ["English"]
     f = Formatter({"formatting": {**DEFAULTS["formatting"], "enabled": False}, "text": DEFAULTS["text"]}, {})
-    assert f.prompt == SYSTEM_PROMPT and not f.dialect_words
+    assert f.prompt == SYSTEM_PROMPT and f.dialect_words == {"english"}
+
+
+# --------------------------------------------------------------------------- Claude Code unavailable
+
+def test_language_names_count_as_known_words():
+    # the recogniser hears "Pidgin" as "pitching" / "pigeon"; writing the language's name is formatting
+    words = language_words(["English", "Nigerian Pidgin"])
+    assert {"pidgin", "nigerian", "english", "dey"} <= words
+    assert check_output("pitching they work now", "Pidgin dey work now.") is not None
+    assert check_output("pitching they work now", "Pidgin dey work now.", words) is None
+    assert language_words(["English"]) == {"english"}
+
+
+def test_reset_time_is_read_from_the_limit_message():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from mouthpiece.formatting import _RESETS, _seconds_until_reset
+
+    london = ZoneInfo("Europe/London")
+    now = datetime(2026, 3, 2, 6, 52, tzinfo=london)
+    m = _RESETS.search("You've hit your 5-hour limit · resets 8:15am (Europe/London)")
+    assert _seconds_until_reset(m, now) == (1 * 60 + 23) * 60
+    m = _RESETS.search("You've hit your 5-hour limit · resets 2am (Europe/London)")
+    assert _seconds_until_reset(m, now) == (19 * 60 + 8) * 60  # tomorrow
+    m = _RESETS.search("You've hit your weekly limit · resets Mar 4, 3pm (Europe/London)")
+    assert _seconds_until_reset(m, now) == (2 * 24 * 60 + 8 * 60 + 8) * 60
+    assert _seconds_until_reset(_RESETS.search("resets 25:00"), now) is None
+
+
+def test_claude_unavailable_messages():
+    limit = claude_unavailable("You've hit your 5-hour limit · resets 8:15am (Europe/London)")
+    assert isinstance(limit, ClaudeUnavailable) and limit.short == "Claude usage limit, resets 8:15am"
+    assert limit.until > time.monotonic() + 60
+    vague = claude_unavailable("Usage limit reached")
+    assert vague.short == "Claude usage limit" and vague.until > time.monotonic() + 10 * 60
+    out = claude_unavailable("Not logged in · Please run /login")
+    assert "signed out" in out.short
+    assert claude_unavailable("API Error: 500 Internal server error") is None
+    assert claude_unavailable("Claude Code took longer than 12s") is None
+
+
+def test_usage_limit_pauses_claude(fake_claude, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "limit")
+    f = _formatter(fake_claude)
+    with pytest.raises(ClaudeUnavailable, match="5-hour limit"):
+        f.format("good morning", AppInfo(), f.prepare())
+    assert f.claude_pause() is not None and "now paused: Claude usage limit" in f.describe()
+    # no Claude process is started while paused (it would only take CPU from the recogniser) ...
+    assert f.prepare() is None
+    monkeypatch.setenv("FAKE_MODE", "ok")
+    with pytest.raises(ClaudeUnavailable, match="5-hour limit"):
+        f.format("good morning", AppInfo())
+    # ... until the reset time has passed
+    f._pause.until = time.monotonic() - 1
+    job = f.prepare()
+    assert job is not None and f.format("good morning", AppInfo(), job) == "Good morning."
+    job.proc.wait(5)
+
+
+def test_api_key_takes_over_when_claude_is_unavailable(fake_claude, monkeypatch):
+    import mouthpiece.formatting as fm
+
+    calls = []
+
+    def fake_http_json(url, data, headers, timeout):
+        body = json.loads(data)
+        calls.append((url, body["model"]))
+        assert body["reasoning_effort"] == "low" and body["include_reasoning"] is False
+        return {"choices": [{"message": {"content": "Good morning."}}]}
+
+    monkeypatch.setattr(fm, "http_json", fake_http_json)
+    monkeypatch.setenv("FAKE_MODE", "limit")
+    cfg = {"formatting": {**DEFAULTS["formatting"], "claude_path": fake_claude}, "text": DEFAULTS["text"]}
+    f = Formatter(cfg, {"groq": "key"})
+    assert f.provider == "claude-code" and f.fallback == "groq" and "Groq when Claude" in f.describe()
+    assert f.format("good morning", AppInfo(), f.prepare()) == "Good morning."
+    assert calls == [("https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-120b")]
+    assert f.last_used.startswith("Groq")
+    assert f.prepare() is None  # paused: straight to Groq next time
+    assert f.format("good morning", AppInfo()) == "Good morning." and len(calls) == 2
+
+
+def test_timeouts_do_not_fall_back(fake_claude, monkeypatch):
+    import mouthpiece.formatting as fm
+
+    monkeypatch.setattr(fm, "http_json", lambda *a, **k: pytest.fail("no fallback after a timeout"))
+    monkeypatch.setenv("FAKE_MODE", "slow")
+    cfg = {"formatting": {**DEFAULTS["formatting"], "claude_path": fake_claude, "timeout_s": 0.3},
+           "text": DEFAULTS["text"]}
+    f = Formatter(cfg, {"groq": "key"})
+    job = f.prepare()
+    job.started -= 60
+    with pytest.raises(FormatError, match="longer than"):
+        f.format("good morning", AppInfo(), job)
+    assert f.claude_pause() is None
+    job.proc.wait(5)

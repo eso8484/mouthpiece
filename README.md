@@ -111,6 +111,15 @@ If formatting fails or takes too long, the plain transcript is pasted instead an
 *Pasted (not formatted)*. The same happens when the AI's result doesn't look like your text, for
 example an answer to a question you dictated. Your original wording is kept in the history.
 
+Formatting through Claude Code shares your Claude plan's usage limits with everything else you do
+in Claude. When the limit is reached, or Claude Code is signed out, the pill says so, for example
+*Pasted unformatted: Claude usage limit, resets 8:15am*. Mouthpiece then stops asking Claude until
+the reset time, so dictation isn't slowed down by calls that can't succeed. If you have also added a
+Groq or OpenAI key (`mouthpiece set-key groq`; Groq has a free tier), that key formats in the
+meantime, so your text is still punctuated and cleaned up. Groq (`openai/gpt-oss-120b`) formats
+in about a second, a little less faithfully than Claude: in tests it sometimes left a misheard
+word or dropped a small Pidgin word that Claude kept.
+
 | Setting | Meaning |
 |---|---|
 | `formatting.enabled` | `false` = paste exactly what was recognised |
@@ -157,7 +166,7 @@ mumbled speech can still come out garbled.
 |---|---|---|---|---|
 | **Parakeet TDT 0.6B v3** (local, default) | nothing — offline | **97.4%** | **86.2%** (92.1% end-to-end on a 75 s mixed clip) | 0.15× real time |
 | Parakeet TDT 0.6B v2 (local, English) | `config set transcription.local_model parakeet-v2` | 97.0% | 84.3% | 0.17× real time |
-| Whisper large-v3 on **Groq** (cloud) | `mouthpiece set-key groq` | — | best choice for accents | ~0.5 s per request |
+| Whisper large-v3 on **Groq** (cloud) | `mouthpiece set-key groq` | — | same as Parakeet v3 (see below) | ~1.5 s per chunk, however busy the laptop is |
 | OpenAI gpt-4o-transcribe (cloud) | `mouthpiece set-key openai` + `config set transcription.engine openai` | — | — | ~1 s per request |
 
 (Word accuracy measured on LibriSpeech and on the EdAcc corpus's Nigerian English speakers.
@@ -167,14 +176,20 @@ Tips for 95%+:
 - **Raise your microphone input volume** (Settings → Sound → Input). A quiet microphone is a common cause of mistakes.
 - Put names and jargon you use in `text.vocabulary` (fixes spelling/capitalisation, and guides
   cloud models), and recurring mis-hearings in `[text.replacements]`.
-- For strongly accented speech, a Groq key gives you Whisper large-v3. Groq has a free tier:
-  https://console.groq.com/keys
+- A Groq key gives you Whisper large-v3 (free tier: https://console.groq.com/keys). On 25
+  Nigerian English clips from EdAcc it was as accurate as the local model (65.2% vs 64.5% of
+  words right, scored the same way), on 50 Nigerian Pidgin clips clearly better (54.0% vs 43.6%,
+  before formatting), and it isn't slowed down by a busy laptop. Your audio is then sent to Groq.
+  If the connection drops, the local model takes over (it's kept loaded for that) and the cloud is
+  tried again two minutes later.
 - AI formatting (on by default, see above) also fixes words the recogniser clearly misheard when
   the context makes the right word obvious ("let's get the J" → "let's get the gist").
 
 Long dictation is fast too: while you talk, Mouthpiece cuts the audio at natural pauses and
 transcribes those chunks in the background, so after you release the key only the last few
-seconds remain (≈1–1.8 s wait measured for 25–75 s of speech on the same laptop).
+seconds remain (≈1–1.8 s wait measured for 25–75 s of speech on the same laptop). If you talk
+without pausing, a chunk is cut at the quietest moment after 20 seconds anyway, so the wait after
+release stays short however long you talk.
 
 ## How pasting works (and why it works in terminals)
 
@@ -205,7 +220,7 @@ for everything: `paste.method = "ctrl+v" | "ctrl+shift+v" | "shift+insert" | "ty
 - `~/.config/mouthpiece/secrets.toml` — API keys (mode 600). `mouthpiece set-key groq`
 - `~/.local/share/mouthpiece/models/` — offline models (~670 MB each)
 - `~/.local/share/mouthpiece/history.jsonl` — transcript history, with the unformatted wording
-  as `raw` (`history.enabled = false` to stop)
+  as `raw`, or why a text wasn't formatted as `unformatted` (`history.enabled = false` to stop)
 - `~/.local/state/mouthpiece/mouthpiece.log` — log (`mouthpiece logs -f` when installed as a service)
 
 ## Troubleshooting
@@ -218,7 +233,10 @@ for everything: `paste.method = "ctrl+v" | "ctrl+shift+v" | "shift+insert" | "ty
   `mouthpiece config set audio.input_device "<name or number>"`.
 - Prefer a GNOME shortcut instead of the evdev hotkey? Bind a custom shortcut to `mouthpiece toggle`.
 - Text isn't formatted → `mouthpiece doctor` shows whether Claude Code was found and is signed
-  in, and `mouthpiece status` shows why the last dictation wasn't formatted.
+  in, and `mouthpiece status` shows why the last dictation wasn't formatted. After signing in
+  again or switching Claude accounts, `mouthpiece reload` makes it try Claude again straight away.
+- The machine is busy (a build, many browser tabs, another AI tool working) → the offline model
+  shares the CPU and can get several times slower. A Groq key moves transcription to the cloud.
 
 ## Development
 

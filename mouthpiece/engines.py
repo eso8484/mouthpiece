@@ -165,7 +165,9 @@ class CloudEngine:
             "User-Agent": "mouthpiece/1.0",
         }
         t = time.monotonic()
-        out = http_json(f"{self.base_url}/audio/transcriptions", data=body, headers=headers, timeout=self.timeout)
+        # a chunk normally takes 1-2 s; give up well before the old 30 s so the local model can take over
+        timeout = min(self.timeout, 8.0 + 0.5 * len(audio) / SAMPLE_RATE)
+        out = http_json(f"{self.base_url}/audio/transcriptions", data=body, headers=headers, timeout=timeout)
         log.debug("%s answered in %.2fs", self.label, time.monotonic() - t)
         return str(out.get("text", "")).strip()
 

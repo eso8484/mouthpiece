@@ -84,7 +84,7 @@ enabled = true
 # groq | openai | custom = an OpenAI-compatible chat API (needs a key; custom also needs base_url)
 provider = "auto"
 # "" = the provider's default: Claude Code "opus" (best at keeping your meaning), Groq
-# "llama-3.3-70b-versatile", OpenAI "gpt-4.1-mini". Claude Code also accepts "sonnet" or "haiku".
+# "openai/gpt-oss-120b", OpenAI "gpt-4.1-mini". Claude Code also accepts "sonnet" or "haiku".
 model = ""
 # Claude only: how much the model thinks first. "low" is the fastest and is plenty for formatting.
 effort = "low"

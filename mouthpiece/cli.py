@@ -275,7 +275,7 @@ def _format_or_exit(text: str, cfg: dict, dest: str) -> str:
         out = f.format(text, _destination_app(dest))
     except FormatError as e:
         sys.exit(f"AI formatting failed: {e}")
-    print(f"[formatted by {f.describe()} in {time.monotonic() - t:.1f}s]", file=sys.stderr)
+    print(f"[formatted by {f.last_used} in {time.monotonic() - t:.1f}s]", file=sys.stderr)
     return out
 
 

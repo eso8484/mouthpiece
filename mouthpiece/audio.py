@@ -41,7 +41,9 @@ class Segmenter:
     """Cut float32 audio into utterance-sized segments at pauses."""
 
     min_segment: float = 6.0       # don't cut before this many seconds (more context = better accuracy)
-    max_segment: float = 45.0      # force a cut eventually, at the quietest point
+    # Force a cut by then, at the quietest moment: what is left after you release the key is at
+    # most this long. People who talk without pausing would otherwise wait for all of it.
+    max_segment: float = 20.0
     pause: float = 0.7             # silence needed to cut
     pad: float = 0.25              # silence kept around speech
     on_segment: Callable[[Segment], None] | None = None
@@ -94,13 +96,19 @@ class Segmenter:
             cut = total - pause_frames // 2
             self._emit(cut, final=False)
         elif length >= self.max_segment:
-            # no pause found: cut at the quietest frame of the last 3 seconds
+            # no pause found: cut in the quietest 150 ms of the last 3 seconds, most likely a gap
+            # between two words (a single quiet frame is often just a consonant)
+            width = 5
             window = int(3.0 * SAMPLE_RATE / FRAME)
             min_frames = int(self.min_segment * SAMPLE_RATE / FRAME)
             lo = max(self.seg_start + min_frames, total - window)
-            # quietest frame; on ties the latest, so a steady signal isn't cut into slivers
-            quiet = min(range(lo, total), key=lambda k: (self.frames_db[k], -k)) if lo < total else total
-            self._emit(quiet, final=False)
+            starts = range(lo, total - width + 1)
+            if starts:
+                # on ties the latest, so a steady signal isn't cut into slivers
+                best = min(starts, key=lambda k: (sum(self.frames_db[k:k + width]), -k))
+                self._emit(best + width // 2 + 1, final=False)
+            else:
+                self._emit(total, final=False)
 
     def _emit(self, cut: int, final: bool) -> None:
         frames = self.buf[self.seg_start:cut]

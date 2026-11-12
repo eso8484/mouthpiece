@@ -128,6 +128,28 @@ def test_segmenter_forced_cut_without_pause():
     assert all(len(sg.audio) / SAMPLE_RATE >= 1.0 for sg in segs)  # no slivers
 
 
+
+def test_segmenter_cuts_long_talk_without_pauses():
+    # someone talking for 50 s without a clear pause: what's left after release stays short
+    segs = []
+    s = Segmenter(on_segment=segs.append)
+    s.feed(_tone(50.0))
+    s.flush()
+    lengths = [len(sg.audio) / SAMPLE_RATE for sg in segs]
+    assert len(segs) == 3 and max(lengths) <= 20.5
+    assert abs(sum(lengths) - 50.0) < 0.2  # nothing lost or doubled
+
+
+def test_segmenter_forced_cut_lands_in_a_gap():
+    # 25 s of talk with a short (0.2 s) breath at 18.6 s: too short to cut on, but the forced
+    # cut at 20 s goes there rather than into a word
+    audio = np.concatenate([_tone(18.6), _silence(0.2), _tone(6.2)])
+    segs = []
+    s = Segmenter(on_segment=segs.append)
+    for i in range(0, len(audio), FRAME):
+        s.feed(audio[i:i + FRAME])
+    assert len(segs) == 1 and abs(len(segs[0].audio) / SAMPLE_RATE - 18.7) < 0.3
+
 def test_config_set_value_preserves_comments(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     p = cfgmod.ensure_config()
@@ -155,3 +177,49 @@ def test_parse_cli_value():
     assert cfgmod.parse_cli_value("off", True) is False
     assert cfgmod.parse_cli_value("12", 3) == 12
     assert cfgmod.parse_cli_value("a, b", []) == ["a", "b"]
+
+
+# --------------------------------------------------------------------------- cloud transcription
+
+def test_cloud_timeout_scales_with_audio(monkeypatch):
+    import mouthpiece.engines as eng
+
+    seen = []
+    monkeypatch.setattr(eng, "http_json", lambda url, data, headers, timeout: seen.append(timeout) or {"text": "hi"})
+    e = eng.CloudEngine("groq", "https://example.invalid/v1", "key", "whisper-large-v3")
+    e.transcribe(np.zeros(4 * SAMPLE_RATE, np.float32))
+    e.transcribe(np.zeros(120 * SAMPLE_RATE, np.float32))
+    assert seen == [10.0, 30.0]
+
+
+def test_offline_cloud_falls_back_once_then_skips_ahead(monkeypatch):
+    import types
+
+    from mouthpiece import daemon as dm
+    from mouthpiece.engines import CloudEngine, EngineError
+
+    class DeadCloud(CloudEngine):
+        calls = 0
+
+        def transcribe(self, audio, prompt="", language=""):
+            DeadCloud.calls += 1
+            raise EngineError("network error: timed out")
+
+    class Local:
+        label = "local parakeet-v3"
+
+        def transcribe(self, audio, prompt="", language=""):
+            return "hello from the local model"
+
+    fake = types.SimpleNamespace(cfg={"transcription": {"fallback_to_local": True, "language": "en"}},
+                                 engine=DeadCloud("groq", "https://example.invalid", "k", "m"),
+                                 fallback=Local(), _cloud_down_until=0.0, _prompt_for=lambda s: "")
+    fake._run_fallback = lambda audio, err: dm.Daemon._run_fallback(fake, audio, err)
+    audio = np.zeros(SAMPLE_RATE, np.float32)
+    for _ in range(3):
+        text, err, used = dm.Daemon._run_engine(fake, None, audio)
+        assert text == "hello from the local model" and err is None and used.endswith("(fallback)")
+    assert DeadCloud.calls == 1  # the second and third chunks didn't wait for the cloud again
+    fake._cloud_down_until = 0.0  # two minutes later: the cloud is tried again
+    dm.Daemon._run_engine(fake, None, audio)
+    assert DeadCloud.calls == 2

@@ -106,6 +106,13 @@ def speaks_pidgin(languages: list[str]) -> bool:
     return any(re.search(r"(?i)pidgin|naij", str(lang)) for lang in languages or [])
 
 
+def language_words(languages: list[str]) -> frozenset[str]:
+    """Words a correct formatting may add that the recogniser couldn't write: the grammar words of a
+    dialect the speaker uses, and the names of their languages (it hears "Pidgin" as "pigeon")."""
+    names = {w for lang in languages or [] for w in re.findall(r"[a-z]+", str(lang).lower()) if len(w) >= 4}
+    return frozenset(names | (PIDGIN_WORDS if speaks_pidgin(languages) else set()))
+
+
 def system_prompt(languages: list[str] | None = None) -> str:
     """The instructions for the model, with notes for the languages the speaker uses."""
     langs = [str(x).strip() for x in (languages or []) if str(x).strip()]
@@ -120,7 +127,8 @@ def system_prompt(languages: list[str] | None = None) -> str:
     return "\n\n".join(parts + [_PROMPT_TAIL])
 
 PROVIDERS = ("auto", "claude-code", "groq", "openai", "custom")
-DEFAULT_MODELS = {"claude-code": "opus", "groq": "llama-3.3-70b-versatile", "openai": "gpt-4.1-mini", "custom": ""}
+# Groq retired llama-3.3-70b-versatile for free and developer accounts on 2026-08-16.
+DEFAULT_MODELS = {"claude-code": "opus", "groq": "openai/gpt-oss-120b", "openai": "gpt-4.1-mini", "custom": ""}
 BASE_URLS = {"groq": "https://api.groq.com/openai/v1", "openai": "https://api.openai.com/v1"}
 LABELS = {"claude-code": "Claude (Claude Code)", "groq": "Groq", "openai": "OpenAI", "custom": "custom API"}
 
@@ -130,6 +138,84 @@ STARTUP_ALLOWANCE = 8.0
 
 class FormatError(Exception):
     pass
+
+
+class FormatTimeout(FormatError):
+    pass
+
+
+class ClaudeUnavailable(FormatError):
+    """Claude Code can't format for a while: the plan's usage limit is reached, or it is signed out."""
+
+    def __init__(self, message: str, short: str, until: float) -> None:
+        super().__init__(message)
+        self.short = short   # for the status pill, e.g. "Claude usage limit, resets 8:15am"
+        self.until = until   # time.monotonic() at which Claude is worth trying again
+
+
+_SIGNED_OUT = re.compile(r"(?i)not logged in|/login|invalid api key|oauth token (?:has )?expired|"
+                         r"authentication_error|credit balance is too low")
+_PLAN_LIMIT = re.compile(r"(?i)hit your .{0,20}limit|usage limit|limit reached|\blimit\b.{0,40}\bresets\b")
+_RESETS = re.compile(r"(?i)\bresets\s+(?:at\s+)?(?:(?P<mon>[a-z]{3})[a-z]*\.?\s+(?P<day>\d{1,2}),?\s+(?:at\s+)?)?"
+                     r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>[ap]\.?m\.?)?(?:\s*\((?P<tz>[A-Za-z_]+(?:/[A-Za-z_+-]+)*)\))?")
+LIMIT_PAUSE = 15 * 60      # seconds, when the reset time can't be read
+SIGNED_OUT_PAUSE = 60
+
+
+def _seconds_until_reset(m: re.Match, now=None) -> float | None:
+    """Seconds until a "resets 8:15am (Europe/London)" / "resets Nov 14, 9am" time, or None."""
+    from datetime import datetime, timedelta
+
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(m["tz"]) if m["tz"] else None
+    except Exception:
+        tz = None
+    if now is None:
+        now = datetime.now().astimezone()
+    if tz is not None:
+        now = now.astimezone(tz)
+    hour, minute = int(m["h"]), int(m["m"] or 0)
+    ap = (m["ap"] or "").replace(".", "").lower()
+    if ap:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ap == "pm" else 0)
+    if hour > 23 or minute > 59:
+        return None
+    when = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if m["mon"]:
+        months = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+        mon = m["mon"].lower()
+        if mon not in months:
+            return None
+        try:
+            when = when.replace(month=months.index(mon) + 1, day=int(m["day"]))
+        except ValueError:
+            return None
+        if when < now - timedelta(days=1):
+            when = when.replace(year=when.year + 1)
+    elif when <= now:
+        when += timedelta(days=1)
+    secs = (when - now).total_seconds()
+    return secs if 0 < secs <= 8 * 86400 else None
+
+
+def claude_unavailable(message: str) -> ClaudeUnavailable | None:
+    """If a Claude Code error means "no formatting for a while", say for how long."""
+    now = time.monotonic()
+    if _SIGNED_OUT.search(message):
+        return ClaudeUnavailable(f"Claude Code: {message}", "Claude Code signed out (run claude, then /login)",
+                                 now + SIGNED_OUT_PAUSE)
+    if _PLAN_LIMIT.search(message):
+        m = _RESETS.search(message)
+        secs = _seconds_until_reset(m) if m else None
+        short = "Claude usage limit"
+        if m:
+            short += ", " + re.sub(r"\s*\([^)]*\)\s*$", "", m.group(0)).strip()
+        # a little after the stated time, so the first try after it doesn't hit the limit again
+        return ClaudeUnavailable(f"Claude Code: {message}", short, now + (secs + 30 if secs else LIMIT_PAUSE))
+    return None
 
 
 # --------------------------------------------------------------------------- the request
@@ -375,15 +461,18 @@ class ClaudeCodeJob:
             self.proc.stdin.close()
             self.sent = True
         except (OSError, ValueError) as e:
-            raise FormatError("Claude Code exited before formatting" + self._stderr_tail()) from e
+            tail = self._stderr_tail()
+            raise claude_unavailable(tail) or FormatError("Claude Code exited before formatting" + tail) from e
         if not self.done.wait(timeout):
             self.kill()
-            raise FormatError(f"Claude Code took longer than {timeout:.0f}s")
+            raise FormatTimeout(f"Claude Code took longer than {timeout:.0f}s")
         ev = self.result
         if ev is None:
-            raise FormatError("Claude Code stopped without an answer" + self._stderr_tail())
+            tail = self._stderr_tail()
+            raise claude_unavailable(tail) or FormatError("Claude Code stopped without an answer" + tail)
         if ev.get("is_error") or ev.get("subtype") != "success":
-            raise FormatError(f"Claude Code: {str(ev.get('result') or ev.get('subtype'))[:200]}")
+            msg = str(ev.get("result") or ev.get("subtype"))[:200]
+            raise claude_unavailable(msg) or FormatError(f"Claude Code: {msg}")
         return str(ev.get("result") or "")
 
     def kill(self) -> None:
@@ -427,12 +516,17 @@ class Formatter:
         self.vocabulary = list(text_cfg.get("vocabulary") or [])
         self.languages = [str(x) for x in (text_cfg.get("languages") or [])]
         self.prompt = system_prompt(self.languages)
-        self.dialect_words = PIDGIN_WORDS if speaks_pidgin(self.languages) else frozenset()
+        self.dialect_words = language_words(self.languages)
         self.secrets = secrets
         self.claude: str | None = None
         self.provider, self.problem = self._resolve()
         self.model = str(self.cfg.get("model") or DEFAULT_MODELS.get(self.provider, ""))
         self.effort = str(self.cfg.get("effort") or "") if self.provider == "claude-code" else ""
+        # When Claude Code can't format (usage limit, signed out), an API key takes over if there is one.
+        self.fallback = next((p for p in ("groq", "openai") if self.secrets.get(p)), "") \
+            if self.provider == "claude-code" else ""
+        self._pause: ClaudeUnavailable | None = None
+        self.last_used = ""
 
     def _resolve(self) -> tuple[str, str]:
         want = str(self.cfg.get("provider") or "auto").strip().lower()
@@ -465,11 +559,24 @@ class Formatter:
         if self.provider == "none":
             return f"unavailable: {self.problem}"
         extra = f", effort {self.effort}" if self.effort else ""
-        return f"{LABELS[self.provider]}, model {self.model}{extra}"
+        out = f"{LABELS[self.provider]}, model {self.model}{extra}"
+        if self.fallback:
+            out += f"; {LABELS[self.fallback]} when Claude is unavailable"
+        pause = self.claude_pause()
+        if pause is not None:
+            out += f" (now paused: {pause.short})"
+        return out
+
+    def claude_pause(self) -> ClaudeUnavailable | None:
+        """Why Claude Code isn't being used right now, or None."""
+        p = self._pause
+        if p is not None and time.monotonic() >= p.until:
+            self._pause = p = None
+        return p
 
     # Claude Code processes are started early (while the user talks) and handed back here.
     def prepare(self) -> ClaudeCodeJob | None:
-        if not self.active or self.provider != "claude-code":
+        if not self.active or self.provider != "claude-code" or self.claude_pause() is not None:
             return None
         try:
             return ClaudeCodeJob(self.claude, self.model, self.effort, self.prompt)
@@ -492,17 +599,9 @@ class Formatter:
             raise FormatError(self.problem or "formatting is off")
         message = build_message(text, app, self.vocabulary)
         timeout = self.timeout_for(text)
+        self.last_used = ""
         if self.provider == "claude-code":
-            if job is None or not job.alive():
-                if job is not None:
-                    log.info("the early Claude Code process had exited; starting a new one")
-                    job.kill()
-                job = ClaudeCodeJob(self.claude, self.model, self.effort, self.prompt)
-            timeout += max(0.0, STARTUP_ALLOWANCE - job.age())
-            try:
-                out = job.run(message, timeout)
-            finally:
-                job.finish()
+            out = self._format_with_claude(message, timeout, job)
         else:
             if job is not None:
                 job.kill()
@@ -513,17 +612,59 @@ class Formatter:
             raise FormatError(f"result rejected ({problem})")
         return out
 
-    def _chat_api(self, message: str, timeout: float) -> str:
-        base = (str(self.cfg.get("base_url") or "") or BASE_URLS.get(self.provider, "")).rstrip("/")
+    def _format_with_claude(self, message: str, timeout: float, job: ClaudeCodeJob | None) -> str:
+        pause = self.claude_pause()
+        if pause is None:
+            if job is None or not job.alive():
+                if job is not None:
+                    log.info("the early Claude Code process had exited; starting a new one")
+                    job.kill()
+                job = ClaudeCodeJob(self.claude, self.model, self.effort, self.prompt)
+            try:
+                out = job.run(message, timeout + max(0.0, STARTUP_ALLOWANCE - job.age()))
+                self.last_used = f"{LABELS['claude-code']}, model {self.model}" + (
+                    f", effort {self.effort}" if self.effort else "")
+                return out
+            except ClaudeUnavailable as e:
+                self._pause = pause = e
+                log.warning("not using Claude Code for now: %s", e)
+                if not self.fallback:
+                    raise
+            except FormatTimeout:
+                raise  # the user has waited long enough; paste the transcript
+            except FormatError as e:
+                if not self.fallback:
+                    raise
+                log.warning("%s; trying %s", e, LABELS[self.fallback])
+            finally:
+                job.finish()
+        else:
+            if job is not None:
+                job.kill()
+            if not self.fallback:
+                raise ClaudeUnavailable(str(pause), pause.short, pause.until)
+        return self._chat_api(message, timeout, self.fallback)
+
+    def _chat_api(self, message: str, timeout: float, provider: str = "") -> str:
+        provider = provider or self.provider
+        if provider == self.provider:
+            model = self.model
+            base = str(self.cfg.get("base_url") or "") or BASE_URLS.get(provider, "")
+        else:  # the fallback for Claude Code: that provider's own default model
+            model, base = DEFAULT_MODELS[provider], BASE_URLS[provider]
         body = {
-            "model": self.model,
+            "model": model,
             "temperature": 0,
             "messages": [{"role": "system", "content": self.prompt}, {"role": "user", "content": message}],
         }
+        if provider == "groq" and "gpt-oss" in model:
+            # a reasoning model: formatting needs little thought, and the thinking stays out of the reply
+            body.update(reasoning_effort="low", include_reasoning=False)
         try:
-            out = http_json(f"{base}/chat/completions", data=json.dumps(body).encode(), timeout=timeout,
-                            headers={"Authorization": f"Bearer {self.secrets.get(self.provider, '')}",
+            out = http_json(f"{base.rstrip('/')}/chat/completions", data=json.dumps(body).encode(), timeout=timeout,
+                            headers={"Authorization": f"Bearer {self.secrets.get(provider, '')}",
                                      "Content-Type": "application/json", "User-Agent": "mouthpiece"})
         except EngineError as e:
-            raise FormatError(f"{LABELS[self.provider]}: {e}") from e
+            raise FormatError(f"{LABELS[provider]}: {e}") from e
+        self.last_used = f"{LABELS[provider]}, model {model}"
         return str(((out.get("choices") or [{}])[0].get("message") or {}).get("content") or "")

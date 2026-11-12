@@ -18,7 +18,7 @@ from .config import load_config, load_secrets
 from .context import AppInfo, AppProbe
 from .control import ControlServer
 from .engines import CloudEngine, EngineError, LocalEngine, build_engine
-from .formatting import FormatError, Formatter, speaks_pidgin
+from .formatting import ClaudeUnavailable, FormatError, Formatter, speaks_pidgin
 from .gnome_keys import EscapeSwallower, is_gnome
 from .hotkey import MODIFIER_CODES, Action, Hotkey, HotkeyError, HotkeyListener
 from .injector import Injector
@@ -29,6 +29,10 @@ from .textproc import finalize_spacing, join_segments, postprocess
 log = logging.getLogger(__name__)
 
 _ids = itertools.count(1)
+
+# After the cloud engine fails (offline, slow, out of quota), seconds to use the local model before
+# trying the cloud again.
+CLOUD_RETRY_AFTER = 120.0
 
 # Whisper famously "hears" these in silence/noise. Only applied to cloud Whisper results when
 # almost no speech was detected, so a real "Thank you" reply still gets through.
@@ -87,6 +91,7 @@ class Daemon:
         self.engine = None
         self.engine_error: str | None = None
         self.fallback: LocalEngine | None = None
+        self._cloud_down_until = 0.0
         self._build_engine()
         self.formatter = Formatter(self.cfg, self.secrets)
         self.session: Session | None = None        # the one currently recording
@@ -133,7 +138,24 @@ class Daemon:
             self.engine_error = str(e)
             log.error("engine: %s — using the local model", e)
             self.engine = LocalEngine(self.cfg["transcription"]["local_model"])
+        self._cloud_down_until = 0.0
         threading.Thread(target=self._load_engine, args=(self.engine,), name="engine-load", daemon=True).start()
+        t = self.cfg["transcription"]
+        if isinstance(self.engine, CloudEngine) and t.get("fallback_to_local", True):
+            # loaded in the background now, so losing the connection doesn't add a 10-30 s model load
+            if self.fallback is None or self.fallback.model_key != t["local_model"]:
+                self.fallback = LocalEngine(t["local_model"], int(t.get("threads", 0) or 0))
+            threading.Thread(target=self._load_fallback, args=(self.fallback,), name="fallback-load",
+                             daemon=True).start()
+        else:
+            self.fallback = None  # ~700 MB of memory back
+
+    @staticmethod
+    def _load_fallback(engine: LocalEngine) -> None:
+        try:
+            engine.load()
+        except Exception as e:
+            log.warning("local fallback model failed to load: %s", e)
 
     def _load_engine(self, engine) -> None:
         try:
@@ -311,6 +333,9 @@ class Daemon:
     def _run_engine(self, s: Session, audio: np.ndarray) -> tuple[str, str | None, str]:
         t = self.cfg["transcription"]
         engine = self.engine
+        use_fallback = isinstance(engine, CloudEngine) and t.get("fallback_to_local", True)
+        if use_fallback and time.monotonic() < self._cloud_down_until:
+            return self._run_fallback(audio, "")
         try:
             t0 = time.monotonic()
             text = engine.transcribe(audio, prompt=self._prompt_for(s), language=t.get("language", ""))
@@ -319,15 +344,21 @@ class Daemon:
             return text, None, engine.label
         except Exception as e:
             log.error("%s failed: %s", getattr(engine, "label", "engine"), e)
-            if isinstance(engine, CloudEngine) and t.get("fallback_to_local", True):
-                try:
-                    if self.fallback is None:
-                        self.fallback = LocalEngine(t["local_model"])
-                    text = self.fallback.transcribe(audio)
-                    return text, None, self.fallback.label + " (fallback)"
-                except Exception as e2:
-                    return "", f"{e}; local fallback: {e2}", ""
+            if use_fallback:
+                # offline, slow or out of quota: the next chunks go straight to the local model for a
+                # while instead of each waiting for the cloud to fail again
+                self._cloud_down_until = time.monotonic() + CLOUD_RETRY_AFTER
+                return self._run_fallback(audio, str(e))
             return "", str(e), ""
+
+    def _run_fallback(self, audio: np.ndarray, cloud_error: str) -> tuple[str, str | None, str]:
+        try:
+            if self.fallback is None:
+                self.fallback = LocalEngine(self.cfg["transcription"]["local_model"])
+            text = self.fallback.transcribe(audio)
+            return text, None, self.fallback.label + " (fallback)"
+        except Exception as e2:
+            return "", f"{cloud_error or 'cloud engine unavailable'}; local fallback: {e2}", ""
 
     def handle_result(self, s: Session, index: int, text: str, err: str | None, used: str) -> None:
         if err:
@@ -387,10 +418,12 @@ class Daemon:
             try:
                 plain, text = text, formatter.format(text, app, job)
                 fmt = {"formatted": True, "raw": plain, "format_ms": int((time.monotonic() - t0) * 1000)}
-                log.info("formatted #%d by %s in %.2fs (%d -> %d chars)", s.id, formatter.describe(),
+                log.info("formatted #%d by %s in %.2fs (%d -> %d chars)", s.id, formatter.last_used,
                          time.monotonic() - t0, len(plain), len(text))
             except FormatError as e:
                 fmt["format_error"] = str(e)
+                if isinstance(e, ClaudeUnavailable):
+                    fmt["format_note"] = e.short
                 if not s.cancelled:
                     log.warning("formatting skipped for #%d: %s", s.id, e)
             except Exception as e:  # never lose a dictation because of formatting
@@ -422,9 +455,14 @@ class Daemon:
                          "seconds": round(s.audio_seconds, 1), "method": result.get("method")}
                 if result.get("formatted"):
                     entry["raw"] = result.get("raw")
+                elif result.get("format_error"):
+                    entry["unformatted"] = result.get("format_note") or result["format_error"][:200]
                 history.append(entry)
             if self.session is None:
-                if result.get("format_error"):
+                if result.get("format_note"):  # e.g. the Claude usage limit: say so, it lasts a while
+                    self.overlay.send(cmd="show", state="done", text=f"Pasted unformatted: {result['format_note']}",
+                                      timeout=4.5)
+                elif result.get("format_error"):
                     self.overlay.send(cmd="show", state="done", text="Pasted (not formatted)", timeout=1.8)
                 else:
                     self.overlay.send(cmd="show", state="done", text="Pasted", timeout=0.9)
